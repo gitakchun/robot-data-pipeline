@@ -1,0 +1,187 @@
+# =============================================================
+# 로봇 데이터 파이프라인 - 저장소 레이어
+#   - PostgreSQL : 품질 검사 결과, 에피소드 메타데이터 (정형 데이터)
+#   - MinIO      : raw / curated 버킷 (원본 파일, 학습용 Parquet)
+# 실행:  docker compose up -d
+# 종료:  docker compose down        (데이터는 볼륨에 남음)
+# 초기화: docker compose down -v    (볼륨까지 삭제 = 데이터 전부 삭제)
+# =============================================================
+
+name: robot-pipeline            # 프로젝트 이름. 컨테이너/볼륨/네트워크 이름 앞에 붙음
+
+# ---------------------------------------------------------
+# x- 로 시작하는 키는 Compose가 무시하는 '메모장' 영역.
+# &이름 으로 블록에 이름(앵커)을 붙이고, 아래에서 <<: *이름 으로 재사용 → Airflow 서비스 4개가 공통 설정 공유
+# ---------------------------------------------------------
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.3.2-python3.11
+  user: "50000:0"               # 이미지에 정의된 airflow 사용자(uid 50000)로 실행
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: local-dev-jwt-secret      # 로컬 개발용 고정값
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"                   # 예제 DAG 수십 개 숨김
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"      # 새 DAG는 일시정지 상태로 시작 (실수로 바로 돌지 않게)
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # --- 우리 파이프라인 코드가 쓰는 값 (컨테이너 안에서는 서비스 이름으로 접속) ---
+    PYTHONPATH: /opt/project                                # import pipeline 이 되도록
+    MINIO_ENDPOINT: http://minio:9000
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    PG_HOST: postgres
+    PG_PORT: "5432"             # 컨테이너끼리는 내부 포트 5432 (5433은 맥에서만)
+    POSTGRES_USER: ${POSTGRES_USER}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    POSTGRES_DB: ${POSTGRES_DB}
+  volumes:                      # 맥 폴더를 컨테이너에 연결(bind mount) → 코드 고치면 바로 반영
+    - ./dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./pipeline:/opt/project/pipeline
+    - ./sql:/opt/project/sql
+  depends_on:
+    airflow-init:
+      condition: service_completed_successfully   # init이 '성공적으로 종료'된 뒤에 시작
+  restart: unless-stopped
+
+services:                       # 띄울 컨테이너 목록
+
+  # ---------------------------------------------------------
+  # PostgreSQL
+  # ---------------------------------------------------------
+  postgres:
+    image: postgres:16          # 공식 이미지, 메이저 버전 16 고정
+    container_name: robot-postgres
+    restart: unless-stopped     # 죽으면 자동 재시작 (직접 stop한 경우 제외)
+    environment:                # 컨테이너 안에 넘겨줄 환경변수. ${...}는 .env 파일 값
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}     # 최초 실행 시 이 이름의 DB를 자동 생성
+    ports:
+      - "5433:5432"             # "내 맥 포트:컨테이너 포트" → 맥에서는 localhost:5433으로 접속
+                                # (맥에 직접 설치된 PostgreSQL이 이미 5432를 쓰고 있어서 5433으로 피함)
+    volumes:
+      - pg-data:/var/lib/postgresql/data   # DB 파일을 named volume에 저장 → 컨테이너 지워도 데이터 유지
+    healthcheck:                # "살아 있나?"를 주기적으로 검사
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s              # 5초마다 검사
+      timeout: 3s
+      retries: 10               # 10번 연속 실패하면 unhealthy
+
+  # ---------------------------------------------------------
+  # MinIO (S3 호환 오브젝트 스토리지)
+  #  - 2026.9 MinIO가 Docker Hub/quay 이미지를 내려서 Chainguard 빌드 사용
+  #  - digest(@sha256:...)로 고정 → 언제 받아도 똑같은 이미지
+  # ---------------------------------------------------------
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:2136d593beacf4461187035eca949fe49abd589d5079735025c711ca58fee0c8
+    container_name: robot-minio
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+      # 이미지의 기본 실행 파일(minio) 뒤에 붙는 인자
+      #   server /data            : /data 폴더를 저장소로 서버 실행
+      #   --console-address :9001 : 웹 콘솔은 9001 포트 (API는 기본 9000)
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}           # 관리자 ID (= S3 access key)
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}   # 관리자 PW (= S3 secret key, 8자 이상)
+    ports:
+      - "9000:9000"             # S3 API  → Python(boto3)이 여기로 붙음
+      - "9001:9001"             # 웹 콘솔 → 브라우저로 버킷/파일 확인
+    volumes:
+      - minio-data:/data
+
+  # ---------------------------------------------------------
+  # minio-init: 버킷을 자동으로 만들고 종료되는 1회용 컨테이너
+  # ---------------------------------------------------------
+  minio-init:
+    image: cgr.dev/chainguard/minio-client@sha256:d8a93c5d335509ff353774eefec8f82fa2a2a975e800139702232d8be3dbe6b9
+    container_name: robot-minio-init
+    depends_on:
+      - minio                   # minio 컨테이너가 먼저 시작된 뒤 실행
+    environment:
+      # MC_HOST_<별칭> 형식이면 mc가 'local'이라는 서버 별칭을 자동 등록함
+      # 주소의 'minio'는 서비스 이름 → Compose 내부 네트워크에서 호스트명처럼 쓰임
+      MC_HOST_local: http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000
+    command: ["mb", "--ignore-existing", "local/raw", "local/curated"]
+      # mc mb = make bucket. 이미 있으면 그냥 넘어감 (몇 번 실행해도 결과 동일 = 멱등)
+    restart: on-failure         # MinIO가 아직 준비 안 돼서 실패하면 성공할 때까지 재시도
+
+  # =========================================================
+  # Airflow (워크플로 스케줄러)
+  #  공식 docker-compose(3.3.2)를 줄인 버전
+  #   - CeleryExecutor + Redis + Worker → LocalExecutor (스케줄러가 직접 태스크 실행)
+  #   - 우리가 쓰는 패키지(pandas, boto3, psycopg 등)가 공식 이미지에 이미 있어서 별도 빌드 없음
+  # =========================================================
+
+  # Airflow 자체의 메타DB (DAG 실행 이력, 태스크 상태 등)
+  #  → 우리 데이터 DB(postgres)와 분리: Airflow 업그레이드/초기화가 데이터에 영향 주지 않게
+  airflow-db:
+    image: postgres:16
+    container_name: robot-airflow-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 10
+    # ports 없음 → 맥에서 직접 접속할 일이 없으므로 외부에 열지 않음 (Compose 내부에서만 접근)
+
+  # 1회용: 메타DB 테이블 생성(migrate) + 웹 로그인 계정 생성 후 종료
+  airflow-init:
+    <<: *airflow-common         # 아래 x-airflow-common 블록을 그대로 가져와 붙임 (YAML 앵커)
+    container_name: robot-airflow-init
+    command: ["version"]        # 실제 작업은 이미지의 entrypoint가 아래 환경변수를 보고 수행
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    restart: "no"
+
+  # 웹 UI + REST API (+ 태스크가 상태를 보고하는 Execution API)
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: robot-airflow-apiserver
+    command: api-server
+    ports:
+      - "8088:8080"             # 맥에서 http://localhost:8088 (8080은 예전 강의용 컨테이너들이 쓰던 포트라 피함)
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      retries: 10
+      start_period: 30s
+
+  # DAG 실행 시점을 판단하고, LocalExecutor로 태스크를 직접 실행
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: robot-airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 15s
+      retries: 10
+      start_period: 30s
+
+  # dags/ 폴더의 .py 파일을 주기적으로 읽어 DAG 구조를 DB에 등록
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: robot-airflow-dag-processor
+    command: dag-processor
+
+volumes:                        # Docker가 관리하는 저장 공간 선언
+  pg-data:
+  minio-data:
+  airflow-db-data:
+
+# networks를 따로 안 적으면 Compose가 기본 네트워크(robot-pipeline_default)를 만들어
+# 모든 서비스를 연결해 줌 → 서비스끼리는 'postgres', 'minio' 같은 이름으로 통신

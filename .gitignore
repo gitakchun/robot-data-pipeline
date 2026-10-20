@@ -1,0 +1,7 @@
+.env
+__pycache__/
+.venv/
+.ipynb_checkpoints/
+data/
+airflow/logs/
+.DS_Store

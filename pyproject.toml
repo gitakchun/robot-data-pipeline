@@ -1,0 +1,15 @@
+[project]
+name = "robot-data-pipeline"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "boto3>=1.43.114",
+    "huggingface-hub>=2.2.0",
+    "ipykernel>=7.4.0",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.11.2",
+    "pandas>=3.0.6",
+    "psycopg[binary]>=3.3.6",
+    "pyarrow>=26.0.0",
+    "python-dotenv>=1.2.4",
+]
